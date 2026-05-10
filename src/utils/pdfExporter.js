@@ -3,7 +3,7 @@
  * Generates a styled PDF from the merged unit question bank using jsPDF + jspdf-autotable.
  */
 import jsPDF from 'jspdf';
-import {autoTable} from 'jspdf-autotable';
+import 'jspdf-autotable';
 
 const PRIMARY = [79, 70, 229];   // indigo
 const ACCENT  = [124, 58, 237];  // purple
@@ -141,7 +141,7 @@ function buildDoc(units, subject) {
       lastPart = q.part;
     }
 
-    autoTable(doc, {
+    doc.autoTable({
       startY: yPos,
       margin: { left: margin, right: margin },
       head: [['Part', 'Question', 'Marks', 'Freq']],
