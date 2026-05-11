@@ -1,145 +1,236 @@
 /**
- * questionExtractor.js — v3, robust anchor-based parser
- *
- * Finds question anchors (1(a), (b), OR etc.) ANYWHERE in each line,
- * not just at the start — handles OCR table formatting artifacts.
+ * questionExtractor.js — v4 universal parser
+ * Handles:
+ * - Q1(a)
+ * - Q.1 a
+ * - 1(a)
+ * - (a)
+ * - a)
+ * - a.
+ * - OCR mistakes
+ * - broken spacing
+ * - table formatted PDFs
  */
 
 const PART_MARKS = { a: 3, b: 4, c: 4, d: 10, e: 10 };
 
 function cleanText(s) {
-  return s.replace(/\s+/g, ' ').replace(/[|]/g, '').trim();
+  return s
+    .replace(/[|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function extractSubject(lines) {
-  for (const l of lines.slice(0, 25)) {
-    const m = l.match(/subject\s*(?:name)?\s*[:\-]\s*(.+)/i);
+  for (const l of lines.slice(0, 30)) {
+    const m = l.match(/subject\s*(?:code|name)?\s*[:\-]\s*(.+)/i);
     if (m) return cleanText(m[1]);
   }
   return 'Unknown Subject';
 }
 
 /**
- * Try to find a unit+part anchor in a line.
- * Returns { unitNumber, part, rest } or null.
- * "rest" = the text after the anchor on the same line.
+ * Universal anchor detector
  */
-function findNewUnitAnchor(line) {
-  // Pattern: optional non-word chars, then digit(s), then letter a-e in parens/brackets/alone
-  // Handles: 1(a), 1 (a), 1[a], Q1(a), |1(a)|, l(a) [OCR l→1]
+function detectQuestionAnchor(line) {
+
   const patterns = [
+
+    // Q.1(a)
+    /Q\.?\s*([1-5])\s*[\(\[]\s*([a-e])\s*[\)\]]/i,
+
+    // Q.1 a
+    /Q\.?\s*([1-5])\s+([a-e])/i,
+
+    // Q1a
+    /Q\.?\s*([1-5])([a-e])/i,
+
+    // 1(a)
     /(?:^|[^\d])([1-5])\s*[\(\[]\s*([a-e])\s*[\)\]]/i,
-    /(?:^|[^\d])[lIi1]\s*[\(\[]\s*([a-e])\s*[\)\]]/i, // OCR l→1 for unit 1
+
+    // 1 a
+    /(?:^|[^\d])([1-5])\s+([a-e])/i,
+
+    // OCR Ql(a)
+    /Q\.?\s*[lIi1]\s*[\(\[]?\s*([a-e])\s*[\)\]]?/i,
+
+    // (a)
+    /^[|\s]*[\(\[]\s*([a-e])\s*[\)\]]/i,
+
+    // a)
+    /^[|\s]*([a-e])\s*[\)\]]/i,
+
+    // a.
+    /^[|\s]*([a-e])\s*\./i,
+
+    // a Explain
+    /^[|\s]*([a-e])\s+/i,
+
+    // aExplain
+    /^[|\s]*([a-e])(?=[A-Z])/,
   ];
+
   for (const re of patterns) {
+
     const m = line.match(re);
-    if (m) {
-      // Extract unit number — handle OCR l/I→1
-      const raw = m[1] || '1';
-      const unit = /[lIi]/.test(raw) ? 1 : parseInt(raw, 10);
-      if (unit < 1 || unit > 5) continue;
-      const part = (m[2] || m[1]).toLowerCase();
-      const idx = m.index + m[0].length;
-      const rest = cleanText(line.slice(idx));
-      return { unitNumber: unit, part, rest };
+
+    if (!m) continue;
+
+    let unit = null;
+    let part = null;
+
+    // Full unit + part patterns
+    if (m.length >= 3 && m[2]) {
+
+      if (/[lIi]/.test(m[1])) {
+        unit = 1;
+      } else {
+        unit = parseInt(m[1], 10);
+      }
+
+      part = m[2]?.toLowerCase();
+
+    } else {
+
+      // continuation-only part
+      part = m[1]?.toLowerCase();
     }
+
+    if (!part) continue;
+
+    const idx = m.index + m[0].length;
+
+    return {
+      unitNumber: unit,
+      part,
+      rest: cleanText(line.slice(idx)),
+    };
   }
+
   return null;
 }
 
-/**
- * Try to find a continuation part anchor in a line (no unit number).
- * Returns { part, rest } or null.
- */
-function findPartAnchor(line) {
-  // Patterns: (b), (c), b), [b], b. at start after optional whitespace/pipe
-  const m = line.match(/^[|\s]*[\(\[]\s*([b-e])\s*[\)\]]/i)
-         || line.match(/^[|\s]*([b-e])\s*[\)\]]/i);
-  if (!m) return null;
-  const part = m[1].toLowerCase();
-  const rest = cleanText(line.slice(m.index + m[0].length));
-  return { part, rest };
-}
-
-/** Check if line is an OR divider */
+/** Detect OR separator */
 function isORLine(line) {
-  return /^\s*[|\s\-–—]*\s*OR\s*[|\s\-–—]*\s*$/i.test(line);
+  return /^\s*[|\s\-–—]*OR[|\s\-–—]*$/i.test(line);
 }
 
-/** Lines to skip outright */
-const SKIP_RE = /^(Q\.?\s*No|Q\.?\s*num|Question|Exam|Time|Max|Subject|Instruction|Attempt|Note|Page|S\.No|---|UIT|RGPV|Autonomous)/i;
-
-// ── Main export ───────────────────────────────────────────────────────────────
+/** Skip metadata lines */
+const SKIP_RE =
+  /^(Q\.?\s*No|Question|Exam|Time|Max|Subject|Instruction|Attempt|Note|Page|S\.No|UIT|RGPV|Autonomous)/i;
 
 export function extractQuestionsFromText(rawText) {
-  const allLines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+
+  // Normalize OCR garbage
+  rawText = rawText
+    .replace(/\r/g, '\n')
+    .replace(/\t/g, ' ')
+    .replace(/[|]/g, ' ')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+\n/g, '\n');
+
+  const allLines = rawText
+    .split('\n')
+    .map(l => cleanText(l))
+    .filter(Boolean);
+
   const subject = extractSubject(allLines);
 
   const unitMap = {};
+
   let currentUnit = null;
   let currentPart = null;
   let currentTexts = [];
   let orSeen = false;
 
   function flush() {
-    if (!currentUnit || !currentPart || !currentTexts.length) return;
-    const text = cleanText(currentTexts.join(' '));
-    if (text.length < 6) return;
-    if (!unitMap[currentUnit]) {
-      unitMap[currentUnit] = { unitNumber: currentUnit, coLabel: `CO${currentUnit}`, questions: [] };
+
+    if (!currentUnit || !currentPart || !currentTexts.length) {
+      currentTexts = [];
+      return;
     }
+
+    const text = cleanText(currentTexts.join(' '));
+
+    if (text.length < 6) {
+      currentTexts = [];
+      return;
+    }
+
+    if (!unitMap[currentUnit]) {
+      unitMap[currentUnit] = {
+        unitNumber: currentUnit,
+        coLabel: `CO${currentUnit}`,
+        questions: [],
+      };
+    }
+
     unitMap[currentUnit].questions.push({
       part: currentPart,
       text,
       marks: PART_MARKS[currentPart] ?? null,
       isOrOption: currentPart === 'e' && orSeen,
     });
+
     currentTexts = [];
   }
 
   function stripCO(line) {
+
     const m = line.match(/\bCO[\s\-]?(\d)\s*$/i);
-    if (!m) return { line, co: null };
-    const co = `CO${m[1]}`;
-    if (unitMap[currentUnit]) unitMap[currentUnit].coLabel = co;
-    return { line: line.slice(0, line.length - m[0].length).trim(), co };
+
+    if (!m) return line;
+
+    if (currentUnit && unitMap[currentUnit]) {
+      unitMap[currentUnit].coLabel = `CO${m[1]}`;
+    }
+
+    return line.slice(0, line.length - m[0].length).trim();
   }
 
-  for (const raw of allLines) {
+  for (let raw of allLines) {
+
     if (SKIP_RE.test(raw)) continue;
-    const { line } = stripCO(raw);
-    if (!line || line.length < 2) continue;
 
-    // OR divider
-    if (isORLine(line)) { orSeen = true; continue; }
+    raw = stripCO(raw);
 
-    // New unit anchor: e.g. "1(a) For T(n)..."
-    const newUnit = findNewUnitAnchor(line);
-    if (newUnit) {
-      flush();
-      currentUnit = newUnit.unitNumber;
-      currentPart = newUnit.part;
-      if (newUnit.part === 'a') orSeen = false;
-      if (newUnit.rest) currentTexts.push(newUnit.rest);
+    if (!raw || raw.length < 2) continue;
+
+    // OR separator
+    if (isORLine(raw)) {
+      orSeen = true;
       continue;
     }
 
-    // Continuation part: e.g. "(b) Write down..."
-    if (currentUnit !== null) {
-      const cont = findPartAnchor(line);
-      if (cont) {
-        flush();
-        currentPart = cont.part;
-        if (cont.rest) currentTexts.push(cont.rest);
-        continue;
+    const anchor = detectQuestionAnchor(raw);
+
+    if (anchor) {
+
+      flush();
+
+      if (anchor.unitNumber !== null) {
+        currentUnit = anchor.unitNumber;
       }
+
+      currentPart = anchor.part;
+
+      if (currentPart === 'a') {
+        orSeen = false;
+      }
+
+      if (anchor.rest) {
+        currentTexts.push(anchor.rest);
+      }
+
+      continue;
     }
 
-    // Accumulate question text
+    // Continuation text
     if (currentUnit !== null && currentPart !== null) {
-      currentTexts.push(line);
+      currentTexts.push(raw);
     }
   }
+
   flush();
 
   return {
